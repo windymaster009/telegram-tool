@@ -279,14 +279,40 @@ async def discover_td_destinations(preferred=""):
     global td_destinations
 
     found = {}
-    async for dialog in client.iter_dialogs():
-        title = entity_title(dialog.entity)
-        if TD_MARKER not in title.lower():
-            continue
+    scanned_peer_ids = set()
+    scanned_dialogs = 0
+    main_count = 0
+    archive_count = 0
 
-        pid = peer_id(dialog.entity)
-        label = f"{title}  ({pid})"
-        found[label] = dialog.entity
+    # Telegram splits dialogs into the normal list (folder 0) and Archive
+    # (folder 1). Scan both explicitly so archived [TD] storage channels
+    # are not missed.
+    for folder_id, folder_name in ((0, "main"), (1, "archive")):
+        try:
+            async for dialog in client.iter_dialogs(folder=folder_id):
+                scanned_dialogs += 1
+                entity = dialog.entity
+                pid = peer_id(entity)
+
+                # The same peer can occasionally be exposed more than once.
+                if pid in scanned_peer_ids:
+                    continue
+                scanned_peer_ids.add(pid)
+
+                title = entity_title(entity)
+                if TD_MARKER not in title.lower():
+                    continue
+
+                label = f"{title}  ({pid})"
+                found[label] = entity
+
+                if folder_id == 0:
+                    main_count += 1
+                else:
+                    archive_count += 1
+
+        except Exception as e:
+            log(f"⚠️ Could not scan {folder_name} chats: {e}")
 
     td_destinations = dict(sorted(found.items(), key=lambda item: item[0].lower()))
 
@@ -308,10 +334,21 @@ async def discover_td_destinations(preferred=""):
             selected = values[0]
 
         destination_var.set(selected)
-        destination_status.config(text=f"{len(values)} [TD] storage channel(s) found")
+        destination_status.config(
+            text=(
+                f"{len(values)} [TD] storage channel(s) found "
+                f"(main {main_count}, archive {archive_count})"
+            )
+        )
 
     root.after(0, ui)
-    log(f"☁ Found {len(found)} Telegram Drive destination(s)")
+    log(
+        f"☁ Found {len(found)} Telegram Drive destination(s) "
+        f"(main {main_count}, archive {archive_count}; scanned {scanned_dialogs} dialogs)"
+    )
+
+    if not found:
+        log("ℹ️ No [TD] channels were found in this Telegram account.")
 
 
 # ---------- SERVER-SIDE COPY ----------
@@ -428,7 +465,9 @@ def login_click():
             save_config(api_id_entry.get(), api_hash_entry.get(), phone_entry.get())
             me = await client.get_me()
             display = getattr(me, "username", None) or getattr(me, "first_name", None) or str(getattr(me, "id", "Telegram user"))
-            log(f"✅ Login successful as {display}")
+            username = getattr(me, "username", None)
+            account_label = f"@{username}" if username else display
+            log(f"✅ Login successful as {account_label} (ID {getattr(me, 'id', 'unknown')})")
             await discover_td_destinations()
         except Exception as e:
             log_exception(e)
