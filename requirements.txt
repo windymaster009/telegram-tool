@@ -1,3 +1,4 @@
 telethon
 tkcalendar
 Pillow
+cryptography
