@@ -4,10 +4,11 @@ import os
 import json
 import time
 import traceback
+from io import BytesIO
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, simpledialog
-from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon import TelegramClient, utils
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from telethon.tl.types import MessageMediaWebPage
 from tkcalendar import DateEntry
 from PIL import Image, ImageTk
@@ -37,14 +38,17 @@ fernet = Fernet(key)
 
 # ================= CONFIG =================
 SESSION_NAME = "media_gui_session"
-DOWNLOAD_DIR = "downloads"
 SCRAPE_DELAY = 0.6
 CONFIG_FILE = "config.json"
+TRANSFER_HISTORY_FILE = "transfer_history.jsonl"
+TD_MARKER = "[td]"
 # =========================================
 
 client = None
 bot_running = False
 log_queue = []
+td_destinations = {}
+transfer_history = set()
 
 user_input_value = None
 user_input_event = asyncio.Event()
@@ -105,7 +109,7 @@ def load_config():
 # ---------- HELPERS ----------
 def normalize_channel_id(value: str):
     value = value.strip()
-    if value.startswith("@"):
+    if value.startswith("@") or value.startswith("http://") or value.startswith("https://"):
         return value
     try:
         num = int(value)
@@ -116,6 +120,99 @@ def normalize_channel_id(value: str):
         return int("-100" + str(num))
     except:
         return value
+
+
+def entity_title(entity):
+    return (
+        getattr(entity, "title", None)
+        or getattr(entity, "username", None)
+        or getattr(entity, "first_name", None)
+        or "Unknown"
+    )
+
+
+def peer_id(entity):
+    try:
+        return utils.get_peer_id(entity)
+    except Exception:
+        return getattr(entity, "id", 0)
+
+
+def media_description(msg):
+    ext = ""
+    name = ""
+
+    if getattr(msg, "file", None):
+        ext = (getattr(msg.file, "ext", None) or "").replace(".", "").upper()
+        name = getattr(msg.file, "name", None) or ""
+
+    if getattr(msg, "photo", None):
+        kind = "Image"
+        ext = ext or "JPG"
+    elif getattr(msg, "video", None):
+        kind = "Video"
+        ext = ext or "MP4"
+    elif getattr(msg, "gif", None):
+        kind = "GIF"
+        ext = ext or "GIF"
+    elif getattr(msg, "voice", None):
+        kind = "Voice"
+        ext = ext or "OGG"
+    elif getattr(msg, "audio", None):
+        kind = "Audio"
+        ext = ext or "AUDIO"
+    elif getattr(msg, "sticker", None):
+        kind = "Sticker"
+        ext = ext or "WEBP"
+    else:
+        kind = "File"
+        ext = ext or "FILE"
+
+    if name:
+        return f"{ext} - {kind} ({name})"
+    return f"{ext} - {kind}"
+
+
+def load_transfer_history():
+    history = set()
+    if not os.path.exists(TRANSFER_HISTORY_FILE):
+        return history
+
+    try:
+        with open(TRANSFER_HISTORY_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                history_key = line.strip()
+                if history_key:
+                    history.add(history_key)
+    except Exception as e:
+        log(f"⚠️ Could not read transfer history: {e}")
+
+    return history
+
+
+def remember_transfer(history_key):
+    transfer_history.add(history_key)
+    try:
+        with open(TRANSFER_HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(history_key + "\\n")
+    except Exception as e:
+        log(f"⚠️ Could not save transfer history: {e}")
+
+
+def is_protected_copy_error(exc):
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    protected_markers = (
+        "chatforwardsrestricted",
+        "forwards restricted",
+        "forwarding is restricted",
+        "protected content",
+        "chat_forwards_restricted",
+    )
+    return any(marker in name or marker in text for marker in protected_markers)
+
+
+transfer_history = load_transfer_history()
 
 # ---------- TELEGRAM ----------
 async def telegram_login(api_id, api_hash, phone):
@@ -173,66 +270,168 @@ async def verify_channel(source):
 async def load_channel_preview(source):
     try:
         entity = await client.get_entity(source)
-        name = getattr(entity, "title", "Unknown")
+        name = entity_title(entity)
 
-        photo = await client.download_profile_photo(entity, file="__preview.jpg")
+        # Keep channel preview in memory. No preview/source media is written to disk.
+        photo_bytes = await client.download_profile_photo(entity, file=bytes)
 
         def ui():
             channel_name_label.config(text=name)
-            if photo and os.path.exists(photo):
-                img = Image.open(photo).resize((80, 80))
-                tk_img = ImageTk.PhotoImage(img)
-                channel_photo_label.config(image=tk_img)
+            if photo_bytes:
+                img = Image.open(BytesIO(photo_bytes))
+                img.thumbnail((80, 80))
+                tk_img = ImageTk.PhotoImage(img.copy())
+                channel_photo_label.config(image=tk_img, text="")
                 channel_photo_label.image = tk_img
             else:
                 channel_photo_label.config(image="", text="No Photo")
+                channel_photo_label.image = None
 
         root.after(0, ui)
 
     except:
         log("⚠️ Preview load failed")
 
-# ---------- PROGRESS ----------
-def progress_callback(current, total):
-    if total:
-        percent = (current / total) * 100
-        root.after(0, lambda v=percent: progress_bar.config(value=v))
 
-# ---------- DOWNLOAD ----------
-async def download_media(source, from_date=None):
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    entity = await client.get_entity(source)
+# ---------- TELEGRAM DRIVE DESTINATIONS ----------
+async def discover_td_destinations(preferred=""):
+    global td_destinations
 
-    log(f"📥 Downloading from {entity.title}")
-
-    async for msg in client.iter_messages(entity):  # NEW → OLD
-
-        if not bot_running:
-            log("⛔ Stopped")
-            return
-
-        if not msg.media or isinstance(msg.media, MessageMediaWebPage):
+    found = {}
+    async for dialog in client.iter_dialogs():
+        title = entity_title(dialog.entity)
+        if TD_MARKER not in title.lower():
             continue
 
-        msg_day = msg.date.date()  # ✅ UTC → DATE ONLY
+        pid = peer_id(dialog.entity)
+        label = f"{title}  ({pid})"
+        found[label] = dialog.entity
 
-        # STOP once we go older than selected date
+    td_destinations = dict(sorted(found.items(), key=lambda item: item[0].lower()))
+
+    def ui():
+        values = list(td_destinations.keys())
+        destination_combo["values"] = values
+
+        selected = ""
+        if preferred:
+            if preferred in td_destinations:
+                selected = preferred
+            else:
+                for label in values:
+                    if label.startswith(preferred + "  ("):
+                        selected = label
+                        break
+
+        if not selected and values:
+            selected = values[0]
+
+        destination_var.set(selected)
+        destination_status.config(text=f"{len(values)} [TD] storage channel(s) found")
+
+    root.after(0, ui)
+    log(f"☁ Found {len(found)} Telegram Drive destination(s)")
+
+
+# ---------- SERVER-SIDE COPY ----------
+async def copy_message_server_side(destination, msg):
+    while bot_running:
+        try:
+            # Telegram copies the existing media server-side. The file is not
+            # downloaded to this PC and uploaded again.
+            await client.forward_messages(destination, msg, drop_author=True)
+            return "copied"
+
+        except FloodWaitError as e:
+            log(f"⏳ Telegram flood wait: {e.seconds}s")
+            for _ in range(e.seconds):
+                if not bot_running:
+                    return "stopped"
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            if is_protected_copy_error(e):
+                return "protected"
+            raise
+
+    return "stopped"
+
+
+async def transfer_media(source, destination, from_date=None):
+    source_entity = await client.get_entity(source)
+    destination_entity = destination
+
+    source_pid = peer_id(source_entity)
+    destination_pid = peer_id(destination_entity)
+
+    if source_pid == destination_pid:
+        raise ValueError("Source and destination cannot be the same channel.")
+
+    log(f"📡 Source: {entity_title(source_entity)}")
+    log(f"☁ Destination: {entity_title(destination_entity)}")
+    log("🚀 Telegram → Telegram transfer started (no local media download)")
+
+    copied = 0
+    duplicates = 0
+    protected = 0
+    skipped = 0
+    failed = 0
+
+    async for msg in client.iter_messages(source_entity):  # NEW → OLD
+        if not bot_running:
+            log("⛔ Stopped")
+            break
+
+        msg_day = msg.date.date()
+
         if from_date and msg_day < from_date:
             log("⏹ Reached messages older than selected date — stopping")
             break
 
-        progress_bar["value"] = 0
-        filename = f"{msg_day}_{msg.id}"
+        if not msg.media or isinstance(msg.media, MessageMediaWebPage):
+            skipped += 1
+            continue
 
-        await msg.download_media(
-            file=os.path.join(DOWNLOAD_DIR, filename),
-            progress_callback=progress_callback
-        )
+        history_key = f"{source_pid}:{msg.id}->{destination_pid}"
+        if history_key in transfer_history:
+            duplicates += 1
+            log(f"⏭ Already copied (ID {msg.id})")
+            continue
 
-        log(f"✅ Downloaded {filename}")
+        root.after(0, lambda: progress_bar.config(value=25))
+        description = media_description(msg)
+
+        try:
+            result = await copy_message_server_side(destination_entity, msg)
+
+            if result == "copied":
+                copied += 1
+                remember_transfer(history_key)
+                root.after(0, lambda: progress_bar.config(value=100))
+                log(f"✅ Copied ☁ {description} (ID {msg.id})")
+
+            elif result == "protected":
+                protected += 1
+                root.after(0, lambda: progress_bar.config(value=0))
+                log(f"🔒 Protected media skipped (ID {msg.id})")
+
+            elif result == "stopped":
+                break
+
+        except Exception as e:
+            failed += 1
+            root.after(0, lambda: progress_bar.config(value=0))
+            log(f"❌ Failed ID {msg.id}: {e}")
+
         await asyncio.sleep(SCRAPE_DELAY)
 
+    root.after(0, lambda: progress_bar.config(value=0))
     log("🎉 Done!")
+    log(
+        "📊 Summary: "
+        f"Copied {copied}, Duplicates {duplicates}, "
+        f"Protected {protected}, Skipped {skipped}, Failed {failed}"
+    )
 
 
 # ---------- BUTTONS ----------
@@ -246,7 +445,10 @@ def login_click():
                 phone_entry.get()
             )
             save_config(api_id_entry.get(), api_hash_entry.get(), phone_entry.get())
-            log("✅ Login successful")
+            me = await client.get_me()
+            display = getattr(me, "username", None) or getattr(me, "first_name", None) or str(getattr(me, "id", "Telegram user"))
+            log(f"✅ Login successful as {display}")
+            await discover_td_destinations()
         except Exception as e:
             log_exception(e)
 
@@ -273,6 +475,15 @@ def convert_channel_id():
 
     asyncio.run_coroutine_threadsafe(runner(), loop)
 
+def refresh_destinations_click():
+    if not client:
+        messagebox.showwarning("Login first", "Please login first")
+        return
+
+    preferred = destination_var.get().strip()
+    asyncio.run_coroutine_threadsafe(discover_td_destinations(preferred), loop)
+
+
 def start_bot():
     global bot_running
     if not client:
@@ -282,28 +493,44 @@ def start_bot():
     if bot_running:
         return
 
+    source_raw = channel_entry.get().strip()
+    if not source_raw:
+        messagebox.showerror("Error", "Enter a source Telegram channel first")
+        return
+
+    destination_label = destination_var.get().strip()
+    destination = td_destinations.get(destination_label)
+    if not destination:
+        messagebox.showerror(
+            "Error",
+            "Choose a [TD] destination channel. Click Refresh [TD] if needed."
+        )
+        return
+
     bot_running = True
-    source = normalize_channel_id(channel_entry.get())
+    source = normalize_channel_id(source_raw)
     date_val = cal.get_date() if mode_var.get() == "date" else None
 
     async def runner():
         try:
-            log("⏳ Connecting...")
+            log("⏳ Resolving source...")
             entity = await verify_channel(source)
             if not entity:
-                log("❌ Cannot access channel")
+                log("❌ Cannot access source channel")
                 return
 
-            await load_channel_preview(source)
-            await download_media(source, date_val)
+            await load_channel_preview(entity)
+            await transfer_media(entity, destination, date_val)
 
         except Exception as e:
             log_exception(e)
         finally:
             global bot_running
             bot_running = False
+            root.after(0, lambda: progress_bar.config(value=0))
 
     asyncio.run_coroutine_threadsafe(runner(), loop)
+
 
 def stop_bot():
     global bot_running
@@ -329,8 +556,8 @@ def apply_day_theme():
 
 # ================= UI =================
 root = tk.Tk()
-root.title("WinDy Media Tool")
-root.geometry("1100x600")
+root.title("WinDy Telegram → Drive Tool")
+root.geometry("1150x680")
 
 toolbar_frame = tk.Frame(root, bd=1, relief=tk.RAISED)
 
@@ -378,9 +605,23 @@ phone_entry.pack(fill="x")
 tk.Button(left, text="🔐 LOGIN", command=login_click).pack(fill="x", pady=6)
 tk.Button(left, text="🔄 Convert Real ID", command=convert_channel_id).pack(fill="x")
 
-tk.Label(left, text="Channel").pack(anchor="w", pady=(10, 0))
+tk.Label(left, text="Source Channel", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(10, 0))
 channel_entry = tk.Entry(left)
 channel_entry.pack(fill="x")
+
+tk.Label(left, text="Destination Storage", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(10, 0))
+destination_var = tk.StringVar(value="")
+destination_combo = ttk.Combobox(left, textvariable=destination_var, state="readonly")
+destination_combo.pack(fill="x", pady=(2, 0))
+tk.Button(left, text="☁ Refresh [TD] Channels", command=refresh_destinations_click).pack(fill="x", pady=(4, 0))
+destination_status = tk.Label(
+    left,
+    text="Login to detect Telegram Drive [TD] channels",
+    fg="#555555",
+    wraplength=300,
+    justify="left"
+)
+destination_status.pack(anchor="w", pady=(3, 6))
 
 preview_frame = tk.Frame(left)
 preview_frame.pack(pady=8)
@@ -400,8 +641,16 @@ cal.pack(pady=5)
 
 btns = tk.Frame(left)
 btns.pack(pady=10)
-tk.Button(btns, text="▶ START", width=12, command=start_bot).pack(side=tk.LEFT, padx=5)
-tk.Button(btns, text="⛔ STOP", width=12, command=stop_bot).pack(side=tk.LEFT)
+tk.Button(btns, text="▶ COPY TO DRIVE", width=16, command=start_bot).pack(side=tk.LEFT, padx=5)
+tk.Button(btns, text="⛔ STOP", width=10, command=stop_bot).pack(side=tk.LEFT)
+
+tk.Label(
+    left,
+    text="Telegram → Telegram server-side copy.\\nNo source media is saved in downloads/.",
+    fg="#444444",
+    wraplength=300,
+    justify="left"
+).pack(anchor="w", pady=(4, 0))
 
 tk.Label(right, text="Activity Log", font=("Segoe UI", 12, "bold")).pack(anchor="w")
 
