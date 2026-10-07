@@ -194,7 +194,7 @@ def remember_transfer(history_key):
     transfer_history.add(history_key)
     try:
         with open(TRANSFER_HISTORY_FILE, "a", encoding="utf-8") as f:
-            f.write(history_key + "\\n")
+            f.write(history_key + "\n")
     except Exception as e:
         log(f"⚠️ Could not save transfer history: {e}")
 
@@ -215,25 +215,6 @@ def is_protected_copy_error(exc):
 transfer_history = load_transfer_history()
 
 # ---------- TELEGRAM ----------
-async def telegram_login(api_id, api_hash, phone):
-    global client
-    client = TelegramClient(SESSION_NAME, api_id, api_hash)
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        await client.send_code_request(phone)
-        code = simpledialog.askstring("Telegram Login", "Enter login code:")
-        await client.sign_in(phone, code)
-
-        try:
-            await client.sign_in(password=simpledialog.askstring(
-                "Telegram Login",
-                "2FA Password:",
-                show="*"
-            ))
-        except SessionPasswordNeededError:
-            pass
-
 async def wait_for_user_input(prompt):
     log(prompt)
     user_input_event.clear()
@@ -468,10 +449,11 @@ def convert_channel_id():
             log("❌ Cannot resolve channel")
             return
 
+        resolved = peer_id(entity)
         root.after(0, lambda: channel_entry.delete(0, tk.END))
-        root.after(0, lambda: channel_entry.insert(0, str(source)))
-        log(f"🔄 Resolved: {entity.title}")
-        await load_channel_preview(source)
+        root.after(0, lambda: channel_entry.insert(0, str(resolved)))
+        log(f"🔄 Resolved: {entity_title(entity)} → {resolved}")
+        await load_channel_preview(entity)
 
     asyncio.run_coroutine_threadsafe(runner(), loop)
 
@@ -646,7 +628,7 @@ tk.Button(btns, text="⛔ STOP", width=10, command=stop_bot).pack(side=tk.LEFT)
 
 tk.Label(
     left,
-    text="Telegram → Telegram server-side copy.\\nNo source media is saved in downloads/.",
+    text="Telegram → Telegram server-side copy.\nNo source media is saved in downloads/.",
     fg="#444444",
     wraplength=300,
     justify="left"
