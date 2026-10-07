@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+
+# Local Telegram/session state
+*.session
+*.session-journal
+config.json
+key.key
+transfer_history.jsonl
+
+# Legacy/local media artifacts
+downloads/
+_transfer_temp/
+__preview.jpg
+
+# Build output
+build/
+dist/
